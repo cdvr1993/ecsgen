@@ -16,7 +16,7 @@ import (
 
 	"github.com/gen0cide/ecsgen"
 	"github.com/gen0cide/ecsgen/generator"
-	"github.com/urfave/cli/v2"
+	cli "github.com/urfave/cli/v2"
 	"golang.org/x/tools/imports"
 )
 
@@ -30,17 +30,27 @@ var (
 
 var defaultFilename = "generated_ecs.go"
 
+var funcRgx = regexp.MustCompile(`\.|\[|]|\{|}`)
+
+const (
+	_isZeroSuffix = "IsZero"
+	_anyFuncName  = "any" + _isZeroSuffix
+)
+
 type basic struct {
 	PackageName        string
 	OutputDir          string
 	Filename           string
+	ZeroFunctions      map[string]string
 	IncludeJSONMarshal bool
 	RemoveAtCharacter  bool
 }
 
 // New is a constructor for an empty debug output plugin.
 func New() generator.Generator {
-	return &basic{}
+	return &basic{
+		ZeroFunctions: map[string]string{},
+	}
 }
 
 // ID implements the generator.Generator interface.
@@ -228,11 +238,104 @@ func (b *basic) ToGoCode(n *ecsgen.Node) (string, error) {
 	}
 
 	// Close the type definition and return the result
-	buf.WriteString("}")
-	buf.WriteString("\n")
+	buf.WriteString("}\n\n")
 
 	// if the user included the JSON operator flag, add the implementation
 	if b.IncludeJSONMarshal {
+		strBaseType := n.TypeIdent().Pascal()
+		clearFuncName := clearFunc(strBaseType)
+		unsafeSizeName := fmt.Sprintf("%sSize", clearFuncName)
+		buf.WriteString(
+			fmt.Sprintf("var %s = unsafe.Sizeof(%s{})\n\n",
+				unsafeSizeName,
+				strBaseType))
+		emptySliceName := fmt.Sprintf("%sEmptySlice", clearFuncName)
+		buf.WriteString(
+			fmt.Sprintf("var %s = make([]byte, %s)\n\n",
+				emptySliceName,
+				unsafeSizeName))
+
+		// first build IsZero func
+		funcName := concatFuncSuffix(strBaseType)
+		buf.WriteString(fmt.Sprintf(
+			"// %s implements isZero for %s\n",
+			funcName,
+			strBaseType))
+		buf.WriteString(
+			fmt.Sprintf(
+				"func %s(input *%s) bool {\n",
+				funcName,
+				strBaseType,
+			),
+		)
+		buf.WriteString("\t// fast case when all the struct is empty\n")
+		buf.WriteString("\t// first convert the struct to raw bytes\n")
+		buf.WriteString(fmt.Sprintf("\ttmpSlice := unsafe.Slice(input, %s)\n", unsafeSizeName))
+		buf.WriteString("\ttmpSliceRaw := *(*[]byte)(unsafe.Pointer(&tmpSlice))\n")
+		buf.WriteString("\t// now compare with the pre-allocated empty byte array that matches this size\n")
+		buf.WriteString(fmt.Sprintf(
+			"\tif bytes.Equal(%s, tmpSliceRaw) {\n",
+			emptySliceName))
+		buf.WriteString("\t\treturn true\n")
+		buf.WriteString("\t}\n\n")
+
+		firstOne := true
+		for _, fieldName := range fieldKeys {
+			if firstOne {
+				buf.WriteString("\tret := ")
+			} else {
+				buf.WriteString(" && ")
+			}
+			firstOne = false
+
+			field := n.Children[fieldName]
+			strType := GoFieldType(field)
+			if strType == "bool" {
+				buf.WriteString(
+					fmt.Sprintf(
+						"!input.%s", field.FieldIdent().Pascal(),
+					),
+				)
+			} else {
+				buf.WriteString(
+					fmt.Sprintf(
+						"%s(&input.%s)", b.getZeroFuncForType(strType), field.FieldIdent().Pascal(),
+					),
+				)
+			}
+		}
+		// special case
+		switch {
+		case len(fieldKeys) == 0:
+			buf.WriteString("\treturn true")
+		default:
+			//buf.WriteString(fmt.Sprintf("\n\tfmt.Println(`%s`, ret)\n", clearFuncName))
+			buf.WriteString("\nreturn ret\n")
+		}
+		buf.WriteString("}\n\n")
+
+		// now implement isZero for slice of this type
+		funcNameSlice := fmt.Sprintf("__%s", funcName)
+		strBaseTypeSlice := fmt.Sprintf("[]%s", strBaseType)
+		buf.WriteString(fmt.Sprintf(
+			"// %s implements isZero for %s\n",
+			funcNameSlice,
+			strBaseTypeSlice))
+		buf.WriteString(
+			fmt.Sprintf(
+				"func %s(input *%s) bool {\n",
+				funcNameSlice,
+				strBaseTypeSlice,
+			),
+		)
+		buf.WriteString("\tfor _, val := range *input {\n")
+		buf.WriteString(fmt.Sprintf("\t\tif !%s(&val) {\n", funcName))
+		buf.WriteString("\t\t\treturn false\n")
+		buf.WriteString("\t\t}\n")
+		buf.WriteString("\t}\n")
+		buf.WriteString("\treturn true\n")
+		buf.WriteString("}\n\n")
+
 		// Now we implement at json.Marshaler implementation for each specific type that
 		// removes any nested JSON types that might exist.
 		//
@@ -243,7 +346,7 @@ func (b *basic) ToGoCode(n *ecsgen.Node) (string, error) {
 		buf.WriteString("\n")
 		buf.WriteString(
 			fmt.Sprintf(
-				"func (b %s) MarshalJSON() ([]byte, error) {",
+				"func (b *%s) MarshalJSON() ([]byte, error) {",
 				n.TypeIdent().Pascal(),
 			),
 		)
@@ -257,20 +360,22 @@ func (b *basic) ToGoCode(n *ecsgen.Node) (string, error) {
 		// enumerate the fields for the object fields
 		for _, fieldName := range fieldKeys {
 			field := n.Children[fieldName]
-			if GoFieldType(field) != "bool" {
+			strType := GoFieldType(field)
+			if strType != "bool" {
 				buf.WriteString(
 					fmt.Sprintf(
-						"\tif val := reflect.ValueOf(b.%s); !val.IsZero() {", field.FieldIdent().Pascal(),
+						"\tif !%s(&b.%s) {", b.getZeroFuncForType(strType), field.FieldIdent().Pascal(),
 					),
 				)
 			}
 			buf.WriteString(
 				fmt.Sprintf(
-					"\t\tres[\"%s\"] = b.%s",
+					"\t\tres[\"%s\"] = &b.%s\n",
 					field.Name,
 					field.FieldIdent().Pascal(),
 				),
 			)
+			//buf.WriteString(fmt.Sprintf("\t\tfmt.Println(`%s %s written`)\n", field.Name, field.FieldIdent().Pascal()))
 			if GoFieldType(field) != "bool" {
 				buf.WriteString("\t}")
 			}
@@ -287,6 +392,25 @@ func (b *basic) ToGoCode(n *ecsgen.Node) (string, error) {
 	}
 
 	return buf.String(), nil
+}
+
+func clearFunc(s string) string {
+	return funcRgx.ReplaceAllString(s, "_")
+}
+
+func (b *basic) getZeroFuncForType(s string) string {
+	funcName := concatFuncSuffix(s)
+
+	//_, ok := b.ZeroFunctions[funcName]
+	//if !ok {
+	//	return _anyFuncName
+	//}
+
+	return funcName
+}
+
+func concatFuncSuffix(s string) string {
+	return fmt.Sprintf("%s%s", clearFunc(s), _isZeroSuffix)
 }
 
 // CreateBase generates the top level ECS Base struct that holds all fieldsets and top level fields.
@@ -311,6 +435,70 @@ func (b *basic) CreateBase(r *ecsgen.Root) (string, error) {
 
 	// now to build the buffer that holds the Go type definition
 	buf := new(strings.Builder)
+
+	funcName := concatFuncSuffix("string")
+	b.ZeroFunctions[funcName] = "string"
+	buf.WriteString(fmt.Sprintf("func %s(s *string) bool {\n", funcName))
+	buf.WriteString("\treturn len(*s) == 0\n")
+	buf.WriteString("}\n\n")
+
+	opts := []string{"int32", "int64", "float32", "float64", "time.Duration"}
+	for _, val := range opts {
+		funcName = concatFuncSuffix(val)
+		b.ZeroFunctions[funcName] = val
+		buf.WriteString(fmt.Sprintf("func %s(s *%s) bool {\n", funcName, val))
+		buf.WriteString("\treturn *s == 0\n")
+		buf.WriteString("}\n\n")
+	}
+
+	funcName = concatFuncSuffix("time.Time")
+	b.ZeroFunctions[funcName] = "time.Time"
+	buf.WriteString(fmt.Sprintf("func %s(s *time.Time) bool {\n", funcName))
+	buf.WriteString("\treturn *s == time.Time{}\n")
+	buf.WriteString("}\n\n")
+
+	// slices check the length + each element
+	opts = []string{"string", "time.Time", "map[string]string", "map[string]interface{}"}
+	for _, val := range opts {
+		childFuncName := concatFuncSuffix(val)
+		funcName = fmt.Sprintf("__%s", childFuncName)
+		b.ZeroFunctions[funcName] = fmt.Sprintf("[]%s", val)
+		buf.WriteString(fmt.Sprintf("func %s(s *[]%s) bool {\n", funcName, val))
+		buf.WriteString("\tfor _, val := range *s {\n")
+		buf.WriteString(fmt.Sprintf("\t\tif !%s(&val) {\n", childFuncName))
+		buf.WriteString("\t\t\treturn false\n")
+		buf.WriteString("\t\t}\n")
+		buf.WriteString("\t}\n")
+		buf.WriteString("\treturn true\n")
+		buf.WriteString("}\n\n")
+	}
+
+	// IsZero for maps is like this:
+	//	case Chan, Func, Interface, Map, Pointer, Slice, UnsafePointer:
+	//		return v.IsNil()
+	// so
+	funcName = concatFuncSuffix("map[string]string")
+	b.ZeroFunctions[funcName] = "map[string]string"
+	buf.WriteString(fmt.Sprintf("func %s(s *map[string]string) bool {\n", funcName))
+	buf.WriteString("\treturn *s == nil\n")
+	buf.WriteString("}\n\n")
+
+	funcName = concatFuncSuffix("map[string]interface{}")
+	b.ZeroFunctions[funcName] = "map[string]interface{}"
+	buf.WriteString(fmt.Sprintf("func %s(s *map[string]interface{}) bool {\n", funcName))
+	buf.WriteString("\treturn *s == nil\n")
+	buf.WriteString("}\n\n")
+
+	//buf.WriteString(fmt.Sprintf("func %s(s any) bool {\n", _anyFuncName))
+	//buf.WriteString("\tswitch val := s.(type) {\n")
+	//for k, v := range b.ZeroFunctions {
+	//	buf.WriteString(fmt.Sprintf("\tcase %s:\n", v))
+	//	buf.WriteString(fmt.Sprintf("\t\treturn %s(val)\n", k))
+	//}
+	//buf.WriteString("\t}\n\n")
+	//buf.WriteString("\tval := reflect.ValueOf(s)\n")
+	//buf.WriteString("\treturn val.IsZero()\n")
+	//buf.WriteString("}\n\n")
 
 	// Add the type comment and the definition to the buffer
 	buf.WriteString("// Base defines the top level Elastic Common Schema (ECS) type. This type should be the default for interacting with ECS data, including the marshaling and unmarshaling of it.")
@@ -375,7 +563,7 @@ func (b *basic) CreateBase(r *ecsgen.Root) (string, error) {
 		buf.WriteString("\n")
 		buf.WriteString("// MarshalJSON implements the json.Marshaler interface and removes zero values from returned JSON.")
 		buf.WriteString("\n")
-		buf.WriteString("func (b Base) MarshalJSON() ([]byte, error) {")
+		buf.WriteString("func (b *Base) MarshalJSON() ([]byte, error) {")
 		buf.WriteString("\n")
 
 		// Define the result struct we will populate non-zero fields with
@@ -391,20 +579,22 @@ func (b *basic) CreateBase(r *ecsgen.Root) (string, error) {
 			if b.RemoveAtCharacter && fieldName == "@timestamp" {
 				fieldName = "timestamp"
 			}
-			if GoFieldType(field) != "bool" {
+			strType := GoFieldType(field)
+			if strType != "bool" {
 				buf.WriteString(
 					fmt.Sprintf(
-						"\tif val := reflect.ValueOf(b.%s); !val.IsZero() {", field.FieldIdent().Pascal(),
+						"\tif !%s(&b.%s) {", b.getZeroFuncForType(strType), field.FieldIdent().Pascal(),
 					),
 				)
 			}
 			buf.WriteString(
 				fmt.Sprintf(
-					"\t\tres[\"%s\"] = b.%s",
+					"\t\tres[\"%s\"] = &b.%s\n",
 					fieldName,
 					field.FieldIdent().Pascal(),
 				),
 			)
+			//buf.WriteString(fmt.Sprintf("\t\tfmt.Println(`%s %s written`)\n", field.Name, field.FieldIdent().Pascal()))
 			if GoFieldType(field) != "bool" {
 				buf.WriteString("\t}")
 			}
@@ -415,18 +605,21 @@ func (b *basic) CreateBase(r *ecsgen.Root) (string, error) {
 		// now we enumerate the object fields
 		for _, fieldName := range objectFields {
 			field := r.TopLevel[fieldName]
+			strType := GoFieldType(field)
+			b.ZeroFunctions[concatFuncSuffix(strType)] = strType
 			buf.WriteString(
 				fmt.Sprintf(
-					"\tif val := reflect.ValueOf(b.%s); !val.IsZero() {", field.FieldIdent().Pascal(),
+					"\tif !%s(&b.%s) {", b.getZeroFuncForType(strType), field.FieldIdent().Pascal(),
 				),
 			)
 			buf.WriteString(
 				fmt.Sprintf(
-					"\t\tres[\"%s\"] = b.%s",
+					"\t\tres[\"%s\"] = &b.%s\n",
 					field.Name,
 					field.FieldIdent().Pascal(),
 				),
 			)
+			//buf.WriteString(fmt.Sprintf("\t\tfmt.Println(`%s %s written`)\n", field.Name, field.FieldIdent().Pascal()))
 			buf.WriteString("\t}")
 			buf.WriteString("\n")
 			buf.WriteString("\n")
@@ -509,6 +702,14 @@ func (b *basic) Execute(root *ecsgen.Root) error {
 	imported, err := imports.Process(b.Filename, dstBuf.Bytes(), nil)
 	if err != nil {
 		return fmt.Errorf("error adding imports to generated go code: %v", err)
+	}
+
+	lookFor := []byte("encoding/json")
+	index := bytes.Index(imported, lookFor)
+	if index >= 0 {
+		imported = append(
+			imported[:index],
+			append([]byte("github.com/goccy/go-json"), imported[index+len(lookFor):]...)...)
 	}
 
 	// Now write the resulting Go code to a file

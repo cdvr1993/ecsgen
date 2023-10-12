@@ -7,7 +7,7 @@ import (
 )
 
 func main() {
-	evt := Base{}
+	evt := &Base{}
 	evt.Server.NAT.IP = "192.168.2.4"
 	evt.ECS.Version = "1.5.0"
 	evt.AtTimestamp = time.Now()
